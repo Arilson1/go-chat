@@ -3,6 +3,7 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -15,23 +16,24 @@ var upgrader = websocket.Upgrader{
 }
 
 var (
-	clients   = make(map[*Client]bool)
+	clients   = make(map[*Cliente]bool)
 	clientsMu sync.Mutex
 	broadcast = make(chan []byte)
 )
 
-type Client struct {
-	conn *websocket.Conn
-	send chan []byte
+type Cliente struct {
+	conn     *websocket.Conn
+	send     chan []byte
+	username string
 }
 
-func addClient(client *Client) {
+func addClient(client *Cliente) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 	clients[client] = true
 }
 
-func removeClient(client *Client) {
+func removeClient(client *Cliente) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 
@@ -46,10 +48,31 @@ func HandleMessages() {
 		msg := <-broadcast
 		clientsMu.Lock()
 		for client := range clients {
-			select {
-			case client.send <- msg:
-			default:
-				removeClient(client)
+			// Verifica se a mensagem é privada
+			if len(msg) > 0 && msg[0] == '@' {
+				// Extrai o nome do destinatário
+				partes := strings.SplitN(string(msg), " ", 2)
+				if len(partes) < 2 {
+					continue
+				}
+				destinatario := partes[0][1:] // Remove o '@'
+				mensagem := partes[1]
+
+				// Envia a mensagem apenas para o destinatário
+				if client.username == destinatario {
+					select {
+					case client.send <- []byte(mensagem):
+					default:
+						removeClient(client)
+					}
+				}
+			} else {
+				// Transmite a mensagem para todos os clientes
+				select {
+				case client.send <- msg:
+				default:
+					removeClient(client)
+				}
 			}
 		}
 		clientsMu.Unlock()
@@ -63,25 +86,31 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &Client{conn: conn, send: make(chan []byte, 256)}
+	// Recebe o nome do usuário
+	_, usernameBytes, err := conn.ReadMessage()
+	if err != nil {
+		log.Println("Erro ao ler nome do usuário:", err)
+		conn.Close()
+		return
+	}
+	username := string(usernameBytes)
+
+	client := &Cliente{conn: conn, send: make(chan []byte, 256), username: username}
 	addClient(client)
+
+	log.Printf("Novo cliente conectado: %s\n", username)
 
 	go func() {
 		defer removeClient(client)
-		for {
-			select {
-			case message, ok := <-client.send:
-				if !ok {
-					// Canal fechado
-					conn.WriteMessage(websocket.CloseMessage, []byte{})
-					return
-				}
-				if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-					log.Println("Erro ao escrever mensagem:", err)
-					return
-				}
+
+		for message := range client.send {
+			if err := client.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Println("Erro ao escrever mensagem:", err)
+				return
 			}
 		}
+		// If the loop exits, close the WebSocket gracefully
+		client.conn.WriteMessage(websocket.CloseMessage, []byte{})
 	}()
 
 	// Goroutine para receber mensagens do cliente
